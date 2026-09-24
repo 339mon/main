@@ -238,7 +238,9 @@ def parse_silent_witness_inputs(public_inputs: bytes) -> SilentWitnessInputs:
     high = _require_half_padding(fields[0], "video_hash_hi")
     low = _require_half_padding(fields[1], "video_hash_lo")
 
-    _require_canonical(fields, _SILENT_WITNESS_FIELDS)
+    # The digest is an opaque protocol binding; compare it byte-for-byte below
+    # instead of treating arbitrary SHA-256 output as a BN254 scalar.
+    _require_canonical(fields[:4], _SILENT_WITNESS_FIELDS[:4])
 
     _require_non_zero(fields[2], "credential_root")
     _require_non_zero(fields[3], "nullifier")

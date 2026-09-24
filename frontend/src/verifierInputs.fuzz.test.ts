@@ -111,8 +111,6 @@ class Lcg {
   }
 }
 
-const FIELD_COUNT = PUBLIC_INPUTS_LEN / FIELD_LEN
-
 function toHex(bytes: Uint8Array): string {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
 }
@@ -124,6 +122,7 @@ function setField(data: Uint8Array, index: number, value: Uint8Array): void {
 /** Apply one structured mutation. Always returns a bounded byte string. */
 function mutate(base: Uint8Array, mutator: Mutator, rng: Lcg): Uint8Array {
   const data = Uint8Array.from(base)
+  const fieldCount = Math.floor(data.length / FIELD_LEN)
 
   switch (mutator) {
     case 'truncate_tail':
@@ -155,20 +154,20 @@ function mutate(base: Uint8Array, mutator: Mutator, rng: Lcg): Uint8Array {
     }
 
     case 'field_zero':
-      setField(data, rng.below(FIELD_COUNT), new Uint8Array(FIELD_LEN))
+      setField(data, rng.below(fieldCount), new Uint8Array(FIELD_LEN))
       return data
 
     case 'field_saturate':
-      setField(data, rng.below(FIELD_COUNT), new Uint8Array(FIELD_LEN).fill(0xff))
+      setField(data, rng.below(fieldCount), new Uint8Array(FIELD_LEN).fill(0xff))
       return data
 
     case 'field_modulus':
-      setField(data, rng.below(FIELD_COUNT), MODULUS_BE)
+      setField(data, rng.below(fieldCount), MODULUS_BE)
       return data
 
     case 'field_swap': {
-      const left = rng.below(FIELD_COUNT)
-      const right = rng.below(FIELD_COUNT)
+      const left = rng.below(fieldCount)
+      const right = rng.below(fieldCount)
       const leftField = data.slice(left * FIELD_LEN, (left + 1) * FIELD_LEN)
       const rightField = data.slice(right * FIELD_LEN, (right + 1) * FIELD_LEN)
       setField(data, left, rightField)
@@ -298,7 +297,7 @@ describe('rejection signals', () => {
     const base = positiveFrames.get(SCHEMAS[0])!
     const rng = new Lcg(seed)
 
-    for (let index = 0; index < 128; index += 1) {
+    for (let index = 0; index < PUBLIC_INPUTS_LEN; index += 1) {
       const mutator = MUTATORS[rng.below(MUTATORS.length)]
       const mutant = mutate(base, mutator, rng)
 

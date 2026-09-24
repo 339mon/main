@@ -26,6 +26,8 @@ import {
   VerifierInputError,
   classify,
   decodeHex,
+  encodeFieldToBytes32Hex,
+  encodePublicInputs,
   parsePublicInputs,
 } from './verifierInputs'
 
@@ -135,4 +137,29 @@ describe('boundary behaviour outside the corpus', () => {
     expect(rendered).not.toContain('ff'.repeat(8))
     expect(Object.keys(signal).sort()).toEqual(['codec', 'field', 'rejectCode'])
   })
+
+  it('encodes Noir fields canonically and deterministically', () => {
+    expect(encodeFieldToBytes32Hex('0x2a')).toBe('00'.repeat(31) + '2a')
+    expect(encodeFieldToBytes32Hex('42')).toBe('00'.repeat(31) + '2a')
+    expect(encodePublicInputs(['1', '2'], ['first', 'second'])).toBe(
+      '00'.repeat(31) + '01' + '00'.repeat(31) + '02',
+    )
+  })
+
+  it.each(['-1', BN254_SCALAR_FIELD_MODULUS.toString(), '0x' + 'ff'.repeat(32)])(
+    'rejects non-canonical Noir field %j without reducing it',
+    (value) => {
+      expect(() => encodeFieldToBytes32Hex(value, 'witness')).toThrow(VerifierInputError)
+      try {
+        encodeFieldToBytes32Hex(value, 'witness')
+      } catch (error) {
+        expect((error as VerifierInputError).code).toBe('non_canonical_field')
+        expect((error as VerifierInputError).signal()).toEqual({
+          codec: CODEC_ID,
+          rejectCode: 'non_canonical_field',
+          field: 'witness',
+        })
+      }
+    },
+  )
 })

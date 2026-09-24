@@ -30,7 +30,7 @@ CODEC_ID = "hpx-vi/1"
 VECTOR_VERSION = 1
 
 FIELD_LEN = 32
-PUBLIC_INPUTS_LEN = 128
+PUBLIC_INPUTS_LEN = 160
 MIN_PROOF_BYTES = 64
 MAX_PROOF_BYTES = 65536
 
@@ -43,6 +43,7 @@ BN254_R_HEX = "30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001"
 # 7 zero bytes of BN254 padding followed by the 25 ASCII bytes of
 # "HARPOCRATES_REVOCATION_V1".
 DOMAIN_HEX = ("00" * 7) + b"HARPOCRATES_REVOCATION_V1".hex()
+DOMAIN_TAG_HEX = "4aa038f0a27b6675d7122ae2d4e197c21e83fbe30143a5c83ff35c9514b92c55"
 
 ZERO = "00" * FIELD_LEN
 ONES = "ff" * FIELD_LEN
@@ -60,8 +61,8 @@ PROOF_MIN = "ab" * MIN_PROOF_BYTES
 PROOF_TYPICAL = "cd" * 512
 
 
-def silent(hi: str, lo: str, root: str, nullifier: str) -> str:
-    return hi + lo + root + nullifier
+def silent(hi: str, lo: str, root: str, nullifier: str, domain: str = DOMAIN_TAG_HEX) -> str:
+    return hi + lo + root + nullifier + domain
 
 
 def revocation(root: str, nullifier: str, domain: str, credential: str) -> str:
@@ -326,6 +327,15 @@ def build_cases() -> list[dict[str, object]]:
             "domain_mismatch",
         )
     )
+    cases.append(
+        case(
+            "sw-neg-044-domain-mismatch",
+            "silent_witness/v1",
+            "Silent-witness domain tag must match the protocol binding.",
+            silent(VIDEO_HI, VIDEO_LO, CREDENTIAL_ROOT, NULLIFIER, ONES),
+            "domain_mismatch",
+        )
+    )
 
     # ---- proof blob bounds ------------------------------------------------
     cases.append(
@@ -388,9 +398,10 @@ def build_document() -> dict[str, object]:
         "schemas": {
             "silent_witness/v1": [
                 "video_hash_hi",
-                "video_hash_lo",
-                "credential_root",
-                "nullifier",
+            "video_hash_lo",
+            "credential_root",
+            "nullifier",
+            "domain_tag",
             ],
             "revocation_witness/v1": [
                 "revocation_root",
