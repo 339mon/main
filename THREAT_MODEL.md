@@ -255,6 +255,13 @@ and `metadata_hash` for content they did not actually review.
 | `register_seal` requires `issuer.require_auth()` — the issuer's Stellar keypair must sign | `lib.rs` → `register_seal` |
 | Typed `IssuerAdded` / `IssuerRevoked` events enable off-chain monitoring | `lib.rs` → event structs |
 
+**Control (#357):** The `revocation_witness` Merkle tree is protocol-bounded at
+`MAX_REVOCATION_WITNESS_DEPTH = 3` (`MAX_REVOCATION_LEAVES = 8`). The Noir
+circuit is fixed at this depth; host tooling (`zk/tools/revocation_depth.py`,
+verifier codec) rejects oversized depth before proving so hostile trees cannot
+inflate witness size or proving cost at this boundary. Depth changes require a
+new circuit version.
+
 **Residual risk:** Revocation is reactive, not proactive. Records registered
 before revocation remain `STATUS_REGISTERED` on-chain. The admin must manually
 call `revoke_proof` for each fraudulent record — there is no bulk revocation.

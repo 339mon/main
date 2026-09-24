@@ -75,6 +75,12 @@ SILENT_WITNESS_DOMAIN_TAG: Final[bytes] = hashlib.sha256(
 SCHEMA_SILENT_WITNESS: Final[str] = "silent_witness/v1"
 SCHEMA_REVOCATION_WITNESS: Final[str] = "revocation_witness/v1"
 
+#: Protocol Merkle-depth bound for ``revocation_witness/v1`` (#357).
+#: Must match the Noir globals and the Soroban registry constants.
+MAX_REVOCATION_WITNESS_DEPTH: Final[int] = 3
+#: Leaf capacity implied by ``MAX_REVOCATION_WITNESS_DEPTH`` (``2**depth``).
+MAX_REVOCATION_LEAVES: Final[int] = 8
+
 _HEX_DIGITS: Final[frozenset[str]] = frozenset("0123456789abcdefABCDEF")
 
 
@@ -313,3 +319,17 @@ def classify(schema: str, public_inputs_hex: str, proof_hex: str) -> str | None:
     except VerifierInputError as error:
         return error.code.value
     return None
+
+
+def check_revocation_witness_depth(depth: object) -> None:
+    """Reject a Merkle depth outside the protocol bound.
+
+    Privacy-safe: raises :class:`VerifierInputError` with a stable code and the
+    field name ``depth`` only — never leaves, secrets, or witness material.
+    """
+    if isinstance(depth, bool) or not isinstance(depth, int):
+        raise VerifierInputError(RejectCode.MALFORMED_HEX, "depth")
+    if depth < 1:
+        raise VerifierInputError(RejectCode.LENGTH, "depth")
+    if depth > MAX_REVOCATION_WITNESS_DEPTH:
+        raise VerifierInputError(RejectCode.PROOF_OVERSIZE, "depth")
