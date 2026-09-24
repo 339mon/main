@@ -35,6 +35,10 @@ const DEFAULT_APPROVAL_TTL_SECS: u64 = 86_400;
 const MAX_LINEAGE_DEPTH: u32 = 4;
 const MAX_LINEAGE_FANOUT: u32 = 4;
 const MAX_LINEAGE_PAYLOAD_BYTES: u32 = 4096;
+/// Max children returned by a single `list_lineage_children` page (#335).
+pub const MAX_LINEAGE_CHILDREN_PAGE: u32 = 50;
+/// Max indexed children stored per parent proof/digest (#335).
+pub const MAX_LINEAGE_CHILDREN_PER_PARENT: u32 = 256;
 
 // ---------------------------------------------------------------------------
 // Proof-history bounds (#90)
@@ -273,6 +277,16 @@ pub struct LineageRecord {
     pub operation_type: Symbol,
     pub output_digest: BytesN<32>,
     pub depth: u32,
+}
+
+/// One page of child output digests for a lineage parent (#335).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LineageChildrenPage {
+    pub children: SorobanVec<BytesN<32>>,
+    /// Absolute offset of the next unread child (equals `total` when exhausted).
+    pub next_offset: u32,
+    pub total: u32,
 }
 
 #[contracttype]
@@ -669,6 +683,16 @@ pub enum DataKey {
     TimelockMinDelay,
     /// Schema definition by schema hash.
     Schema(BytesN<32>),
+    /// Lineage record keyed by output digest.
+    Lineage(BytesN<32>),
+    /// Count of indexed children for a parent proof/digest (#335).
+    LineageChildSeq(BytesN<32>),
+    /// Child output digest at 1-based sequence for a parent (#335).
+    LineageChild(BytesN<32>, u32),
+    /// Dispute record (and supersession reverse-index) by id/hash.
+    Dispute(BytesN<32>),
+    /// Open dispute counter per proof id.
+    ProofOpenDisputeCount(BytesN<32>),
 }
 
 #[contracterror]
@@ -739,6 +763,18 @@ pub enum RegistryError {
     UnknownSchema = 50,
     InactiveSchema = 51,
     SchemaVersionMismatch = 52,
+    /// Lineage parents missing, empty, or otherwise malformed.
+    InvalidLineage = 53,
+    /// Output digest appears in its own parent set (cycle).
+    LineageCycle = 54,
+    /// Lineage depth exceeds MAX_LINEAGE_DEPTH.
+    LineageTooDeep = 55,
+    /// Parent fan-out exceeds MAX_LINEAGE_FANOUT.
+    LineageFanOutExceeded = 56,
+    /// `list_lineage_children` limit was zero or above the page cap (#335).
+    LineageChildrenLimitExceeded = 57,
+    /// Parent already holds MAX_LINEAGE_CHILDREN_PER_PARENT children (#335).
+    LineageChildrenSaturated = 58,
 }
 
 #[contract]
@@ -2068,12 +2104,84 @@ impl HarpocratesRegistry {
             output_digest: output_digest.clone(),
             depth,
         };
-        env.storage().persistent().set(&DataKey::Lineage(output_digest.clone()), &record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Lineage(output_digest.clone()), &record);
+
+        // Index this derivative under each parent for reverse (children) queries (#335).
+        for parent in parent_proof_ids.iter() {
+            append_lineage_child(&env, &parent, &output_digest);
+        }
+
         record
     }
 
     pub fn get_lineage(env: Env, output_digest: BytesN<32>) -> Option<LineageRecord> {
         env.storage().persistent().get(&DataKey::Lineage(output_digest))
+    }
+
+    /// Return how many child digests are indexed under `parent_proof_id` (#335).
+    pub fn get_lineage_children_count(env: Env, parent_proof_id: BytesN<32>) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::LineageChildSeq(parent_proof_id))
+            .unwrap_or(0)
+    }
+
+    /// Paginate child output digests for a parent proof or lineage digest (#335).
+    ///
+    /// - `offset` is 0-based into the stable registration order.
+    /// - `limit` must be in `1..=MAX_LINEAGE_CHILDREN_PAGE`.
+    /// - Missing parents yield an empty page with `total == 0` (privacy-safe).
+    pub fn list_lineage_children(
+        env: Env,
+        parent_proof_id: BytesN<32>,
+        offset: u32,
+        limit: u32,
+    ) -> LineageChildrenPage {
+        if limit == 0 || limit > MAX_LINEAGE_CHILDREN_PAGE {
+            panic_with_error!(&env, RegistryError::LineageChildrenLimitExceeded);
+        }
+
+        let total: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LineageChildSeq(parent_proof_id.clone()))
+            .unwrap_or(0);
+
+        let mut children = SorobanVec::new(&env);
+        if offset >= total {
+            return LineageChildrenPage {
+                children,
+                next_offset: total,
+                total,
+            };
+        }
+
+        let end = if total - offset < limit {
+            total
+        } else {
+            offset + limit
+        };
+
+        let mut idx = offset;
+        while idx < end {
+            let seq = idx + 1; // 1-based storage keys
+            if let Some(child) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, BytesN<32>>(&DataKey::LineageChild(parent_proof_id.clone(), seq))
+            {
+                children.push_back(child);
+            }
+            idx += 1;
+        }
+
+        LineageChildrenPage {
+            children,
+            next_offset: end,
+            total,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2648,6 +2756,47 @@ fn require_active_credential_root(env: &Env, credential_root: &BytesN<32>) {
     if !record.active {
         panic_with_error!(env, RegistryError::RevokedCredentialRoot);
     }
+}
+
+fn validate_lineage(
+    env: &Env,
+    parent_proof_ids: &SorobanVec<BytesN<32>>,
+    output_digest: &BytesN<32>,
+    depth: u32,
+) {
+    if parent_proof_ids.is_empty() {
+        panic_with_error!(env, RegistryError::InvalidLineage);
+    }
+    if parent_proof_ids.len() > MAX_LINEAGE_FANOUT {
+        panic_with_error!(env, RegistryError::LineageFanOutExceeded);
+    }
+    if depth == 0 || depth > MAX_LINEAGE_DEPTH {
+        panic_with_error!(env, RegistryError::LineageTooDeep);
+    }
+
+    for parent in parent_proof_ids.iter() {
+        if parent == *output_digest {
+            panic_with_error!(env, RegistryError::LineageCycle);
+        }
+        let is_known_parent = env.storage().persistent().has(&DataKey::Proof(parent.clone()))
+            || env.storage().persistent().has(&DataKey::Lineage(parent.clone()));
+        if !is_known_parent {
+            panic_with_error!(env, RegistryError::InvalidLineage);
+        }
+    }
+}
+
+fn append_lineage_child(env: &Env, parent: &BytesN<32>, child: &BytesN<32>) {
+    let seq_key = DataKey::LineageChildSeq(parent.clone());
+    let current: u32 = env.storage().persistent().get(&seq_key).unwrap_or(0);
+    if current >= MAX_LINEAGE_CHILDREN_PER_PARENT {
+        panic_with_error!(env, RegistryError::LineageChildrenSaturated);
+    }
+    let next = current + 1;
+    env.storage()
+        .persistent()
+        .set(&DataKey::LineageChild(parent.clone(), next), child);
+    env.storage().persistent().set(&seq_key, &next);
 }
 
 fn save_record(
@@ -3249,6 +3398,8 @@ mod test_scoped_nullifier;
 mod test_state_machine;
 #[cfg(test)]
 mod test_dispute;
+#[cfg(test)]
+mod test_lineage;
 #[cfg(test)]
 pub mod test_timelock;
 #[cfg(test)]
