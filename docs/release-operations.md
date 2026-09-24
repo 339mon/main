@@ -23,6 +23,24 @@ non-active rollout. The workflow also runs each component's existing test and
 build path. A digest mismatch is deliberate: rebuild and review all dependent
 artifacts, then update one manifest in the same reviewed change.
 
+
+## Cross-layer compatibility report
+
+Operators and CI can publish a privacy-safe compatibility report derived from
+the same canonical manifest:
+
+```bash
+python3 devx/compatibility_report.py --write --stable --check
+python3 -m unittest discover -s devx -p 'test_compatibility_report.py' -v
+```
+
+The report lands at [`release/compatibility-report.json`](../release/compatibility-report.json).
+It records per-layer version and interface checks plus cross-layer proof-system,
+crypto-domain, metadata, and digest outcomes. Digest drift is reported as
+`version_compatible_digest_drift` so version alignment remains visible while
+artifact pins are refreshed. Use `--strict` when digests must match exactly.
+The report never includes media, witnesses, credentials, proofs, or secrets.
+
 ## Release state machine
 
 `candidate -> staged -> active` is the forward path. `candidate` is valid for
