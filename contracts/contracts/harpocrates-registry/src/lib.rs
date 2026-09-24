@@ -3988,6 +3988,8 @@ mod test_fuzz;
 #[cfg(test)]
 mod test_invariants;
 #[cfg(test)]
+mod test_identity_tier_properties;
+#[cfg(test)]
 mod test_pause;
 #[cfg(test)]
 mod test_revocation;
