@@ -107,6 +107,14 @@ git pull
 docker compose up --build -d
 ```
 
+**7. API Gateway Schema**
+
+For deployments leveraging an API Gateway, WAF, or Swagger UI, you can generate an OpenAPI 3.1 schema natively:
+
+```bash
+python devx/generate_api_schema.py --output openapi.json
+```
+
 ### Caddy reverse proxy example
 
 ```
