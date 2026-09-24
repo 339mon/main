@@ -41,7 +41,7 @@ fn registers_lineage_with_bounded_validation() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #56)")]
+#[should_panic(expected = "Error(Contract, #60)")]
 fn rejects_excessive_fanout() {
     let env = Env::default();
     env.mock_all_auths();
@@ -74,7 +74,7 @@ fn rejects_excessive_fanout() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #54)")]
+#[should_panic(expected = "Error(Contract, #58)")]
 fn rejects_self_referential_lineage() {
     let env = Env::default();
     env.mock_all_auths();
@@ -164,7 +164,7 @@ fn paginates_lineage_children_in_registration_order() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #57)")]
+#[should_panic(expected = "Error(Contract, #68)")]
 fn rejects_zero_children_page_limit() {
     let env = Env::default();
     env.mock_all_auths();
@@ -178,7 +178,7 @@ fn rejects_zero_children_page_limit() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #57)")]
+#[should_panic(expected = "Error(Contract, #68)")]
 fn rejects_oversized_children_page_limit() {
     let env = Env::default();
     env.mock_all_auths();

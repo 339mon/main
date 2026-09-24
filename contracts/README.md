@@ -21,6 +21,34 @@ cargo test
 stellar contract build
 ```
 
+## Identity-Tier Property Tests
+
+Issue #345 adds focused property tests for identity-tier invariants in
+`contracts/harpocrates-registry/src/test_identity_tier_properties.rs`.
+
+The harness uses a deterministic LCG over reproducible seeds to generate
+registration sequences across Silent Witness (tier 1), Consistent Source
+(tier 2), and Public Seal (tier 3). After every step it checks:
+
+- tier-shaped privacy fields (no source/issuer on tier 1; nullifier only on tier 1)
+- global uniqueness of `proof_id` and `video_hash` across tiers
+- nullifier uniqueness for Silent Witness registrations
+- pause-domain isolation (pausing one tier never blocks the others)
+- lookup consistency (`get_proof` / `get_by_video`)
+- rejected duplicates leave prior storage unchanged
+
+Failure messages report only seeds, tier tags, slot indices, and error codes —
+never proof bytes, public inputs, witnesses, or media.
+
+Run focused:
+
+```
+cargo test -p harpocrates-registry identity_tier -- --nocapture
+```
+
+This change is test-only. It does not alter exported contract entry points,
+storage keys, or on-chain migration behavior.
+
 ## Registry State-Machine Fuzzing
 
 Issue #93 adds deterministic state-machine fuzzing for the registry contract in
@@ -63,6 +91,44 @@ simplification, then prints the original seed, the failing step, the shrunk
 command list, and the expected/actual error code. It never prints proof bytes,
 public input bytes, witnesses, media, credentials, signatures, or raw metadata.
 The model uses deterministic slot numbers and synthetic hashes only.
+
+## Upgrade Compatibility Harness
+
+Issue #347 adds a focused upgrade compatibility harness in
+`contracts/harpocrates-registry/src/test_upgrade_compat.rs`. It drives the
+real `upgrade_storage` / `get_storage_schema_version` boundary with:
+
+- positive V1 init + idempotent upgrade calls
+- negative unauthorized upgrade attempts
+- legacy registries missing `DataKey::SchemaVersion` (stamp without event)
+- regression that Tier-2 source proofs and the verifier pointer survive upgrade
+
+```bash
+cd contracts
+cargo test -p harpocrates-registry upgrade_compat -- --nocapture
+```
+
+### Compatibility, Migration, And Rollback
+
+`upgrade_storage` is the only admin path that advances `DataKey::SchemaVersion`.
+At V1 the call is a no-op when the key is already present. Pre-#85 deployments
+that lack the key are stamped to V1 without emitting `SchemaUpgraded` because
+the on-disk layout is already V1-compatible. Future V2+ migrations must land
+in the sequential branch inside `upgrade_storage`, preserve existing proof /
+video / nullifier records, and must never log media, secrets, witnesses, or
+private keys.
+
+Rollback is redeploying a prior wasm: additive `SchemaVersion` keys are
+ignored by older readers, and no proof rewrite is required for the V1 stamp.
+Operators should call `get_storage_schema_version` after upgrade to confirm
+the stamped version before rotating verifiers.
+
+### Threat Assumptions
+
+The harness assumes Soroban auth + persistent storage semantics. It does not
+exercise live mainnet wasm replace, cryptographic verifier soundness, or real
+evidence payloads. Failure modes under test are deterministic `RegistryError`
+codes (`Unauthorized`) and privacy-safe absence of `SchemaUpgraded` on no-ops.
 
 ### Compatibility And Rollout
 
@@ -121,6 +187,8 @@ The current registry exports:
 
 ```text
 init
+get_storage_schema_version
+upgrade_storage
 propose_admin
 cancel_admin_transfer
 accept_admin
@@ -149,6 +217,13 @@ get_proof_status
 get_proof_history
 get_proof_history_at
 get_proof_history_count
+open_dispute
+respond_dispute
+resolve_dispute
+dismiss_dispute
+supersede_dispute
+get_dispute
+get_open_dispute_count
 verify_proof
 expire_proof
 correct_proof
@@ -252,7 +327,20 @@ The registry emits typed Soroban events with `#[contractevent]`:
 ["pause", "set", domain]          => paused_by, paused_at, expires_at
 ["pause", "clear", domain]        => unpaused_by, unpaused_at
 ["guardian", "set", guardian]     => {}
+["dispute", "open", dispute_id]   => proof_id, reason, reporter_hash, commitment_hash, respond_deadline
+["dispute", "respond", dispute_id] => proof_id, response_commitment, resolve_deadline
+["dispute", "resolve", dispute_id] => proof_id, resolved_at
+["dispute", "dismiss", dispute_id] => proof_id, resolved_at
+["dispute", "supersede", dispute_id] => proof_id, superseded_by, resolved_at
+["verif", "schedule"]             => active_verifier, pending_verifier, activation_ledger, overlap_window, rollback_window
+["verif", "activate"]             => active_verifier, previous_verifier, rollback_window_end
+["verif", "rollback"]             => active_verifier, previous_verifier
 ```
+
+For every successful proof registration, `proof/reg` is emitted before the
+corresponding `proof/history` event. Batch registration emits that same pair
+for each derived proof in input order. Rejected registrations emit neither
+event, so indexers can treat the ordered pair as the registration boundary.
 
 ## Lifecycle History (#90)
 
@@ -309,6 +397,25 @@ All registration functions and `revoke_proof` automatically record history.
 
 Proofs registered before this feature have zero history entries. `get_proof_history`
 returns an empty vector for such proofs. The existing `ProofRecord` schema is unchanged.
+
+## Dispute And Supersession
+
+`open_dispute`, `respond_dispute`, `resolve_dispute`, `dismiss_dispute`,
+`supersede_dispute`, `get_dispute`, and `get_open_dispute_count` add a bounded,
+auditable dispute/correction state machine. Disputes never modify or delete the
+disputed proof and are independent of revocation - a disputed proof can still
+report `Valid` from `get_proof_status`. Reporter identity is stored only as a
+caller-supplied `reporter_hash` commitment, and events carry commitment hashes
+and timestamps only.
+
+Bounds: `MAX_OPEN_DISPUTES_PER_PROOF = 4`, `REPORTER_COOLDOWN_SECS = 86400`,
+`RESPOND_DEADLINE_SECS = 604800`, `RESOLVE_DEADLINE_SECS = 1209600`. All new
+storage keys (`Dispute`, `ProofOpenDisputeCount`, `ReporterCooldown`) are
+additive, so upgrading requires no migration and rollback is a plain wasm
+redeploy.
+
+See [DISPUTE.md](DISPUTE.md) for the state machine, error codes, threat notes,
+and migration/rollback details.
 
 ## Scripts
 

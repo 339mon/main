@@ -1,17 +1,20 @@
 #!/usr/bin/env node
 
-import { readFile, writeFile } from 'node:fs/promises'
+import { createReadStream } from 'node:fs'
+import { writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import process from 'node:process'
+import { StrKey } from '@stellar/stellar-sdk'
 import { createProofManifest, parseManifest, serializeManifest } from './manifest.js'
 import { validateMetadata, fileHash, canonicalMetadataHash, type HarpocratesMetadata } from './metadata.js'
-import { sha256 } from './hashing.js'
 import { lookupByVideoHash, verifyTransaction } from './stellar-lookup.js'
 import { createReceipt, formatReceipt, type VerificationReceipt } from './receipt.js'
-import { computeResult } from './normalize.js'
+import { classifyVerification } from './normalize.js'
+import { verifyVerificationReceipt, decodeReceiptFromQr, type SignedVerificationReceipt } from './signed-receipt.js'
 
 // ── CLI argument parsing ──────────────────────────────────────────────────
 
-type Command = 'verify' | 'manifest' | 'hash' | 'help'
+type Command = 'verify' | 'manifest' | 'hash' | 'verify-receipt' | 'help'
 
 function parseArgs(argv: string[]): {
   command: Command
@@ -46,9 +49,16 @@ function parseArgs(argv: string[]): {
 
 // ── I/O helpers ───────────────────────────────────────────────────────────
 
-async function readStdin(): Promise<string> {
+async function readText(path: string): Promise<string> {
   const chunks: Buffer[] = []
-  for await (const chunk of process.stdin) {
+  let size = 0
+  const source = path === '-' ? process.stdin : createReadStream(path)
+  for await (const chunk of source) {
+    size += Buffer.byteLength(chunk)
+    if (size > 1024 * 1024) {
+      if (path !== '-') source.destroy()
+      throw new Error('input exceeds 1 MiB limit')
+    }
     chunks.push(Buffer.from(chunk))
   }
   return Buffer.concat(chunks).toString('utf-8')
@@ -82,6 +92,8 @@ async function main(): Promise<void> {
       return await handleManifest(flags)
     case 'hash':
       return await handleHash(flags)
+    case 'verify-receipt':
+      return await handleVerifyReceipt(flags)
     case 'help':
     default:
       return printHelp()
@@ -96,61 +108,53 @@ async function handleVerify(flags: Record<string, string>): Promise<void> {
   const sourceAddress = flags['source-address'] || flags.sourceAddress || process.env.HARPOCRATES_SOURCE_ADDRESS
   const outputFormat = flags.output || flags.o || 'text'
   const offline = flags.offline === 'true'
+  const network = flags.network || 'Test SDF Network ; September 2015'
 
-  if (!contractId) {
-    exit(2, '--contract-id is required for verification')
+  if (!contractId || !StrKey.isValidContract(contractId)) {
+    exit(8, 'a valid --contract-id is required for verification')
   }
 
   // ── Read manifest (file, stdin, or flag-constructed) ──────────────────
-  let manifestInput: {
-    proofId: string
-    tier: string
-    network: string
-    contractId: string
-    transactionRef: string
-    videoHash: string
-    metadataHash: string
-    sourceHash: string
-    timestamp: string
+  let manifest: ReturnType<typeof parseManifest>
+
+  if (!manifestPath) {
+    exit(8, '--manifest is required for verification')
+  }
+  try {
+    manifest = parseManifest(await readText(manifestPath))
+  } catch {
+    exit(8, 'invalid or unreadable manifest')
   }
 
-  if (manifestPath === '-') {
-    const raw = await readStdin()
-    manifestInput = parseManifest(raw)
-  } else if (manifestPath) {
-    const raw = await readFile(manifestPath, 'utf-8')
-    manifestInput = parseManifest(raw)
-  } else if (txHash) {
-    exit(2, '--tx-hash requires --manifest for full verification metadata')
-  } else {
-    exit(2, 'Either --manifest or --tx-hash is required for verification')
+  if (manifest.contractId !== contractId) exit(5, 'contract_mismatch')
+  if (manifest.network !== network) exit(4, 'network_mismatch')
+  if (txHash && txHash.toLowerCase() !== manifest.transactionRef.toLowerCase()) {
+    exit(8, 'transaction hash does not match manifest')
   }
 
-  const manifest = createProofManifest(manifestInput)
   let receipt: VerificationReceipt
 
   if (offline) {
     receipt = createReceipt(
       manifest,
-      { status: 'pending', txHash: manifestInput.transactionRef },
+      { status: 'pending', txHash: manifest.transactionRef },
       null,
       'pending',
     )
   } else {
     try {
-      const txVerification = txHash
-        ? await verifyTransaction(txHash, contractId, { rpcUrl, sourceAddress })
-        : { status: 'missing' as const, txHash: manifestInput.transactionRef }
+      const txVerification = await verifyTransaction(manifest.transactionRef, contractId, { rpcUrl, sourceAddress })
 
-      const chainRecord = await lookupByVideoHash(contractId, manifestInput.videoHash, {
+      const chainRecord = await lookupByVideoHash(contractId, manifest.videoHash, {
         rpcUrl,
         sourceAddress,
+        networkPassphrase: network,
       })
 
-      const result = computeResult(chainRecord, txVerification.status)
+      const result = classifyVerification(manifest, txVerification, chainRecord)
       receipt = createReceipt(manifest, txVerification, chainRecord, result)
-    } catch (err) {
-      exit(4, `Verification failed: ${(err as Error).message}`)
+    } catch {
+      exit(8, 'verification dependency failed')
     }
   }
 
@@ -187,14 +191,14 @@ async function handleManifest(flags: Record<string, string>): Promise<void> {
   try {
     let raw: string
     if (inputPath === '-') {
-      raw = await readStdin()
+      raw = await readText('-')
     } else {
-      raw = await readFile(inputPath, 'utf-8')
+      raw = await readText(inputPath)
     }
     const parsed = JSON.parse(raw)
     metadata = validateMetadata(parsed)
-  } catch (err) {
-    exit(3, `Failed to read or validate metadata: ${(err as Error).message}`)
+  } catch {
+    exit(8, 'invalid or unreadable metadata')
   }
 
   if (!flags['tx-hash'] && !flags.txHash) {
@@ -202,6 +206,12 @@ async function handleManifest(flags: Record<string, string>): Promise<void> {
   }
   if (!flags['contract-id'] && !flags.contractId) {
     exit(2, '--contract-id is required for manifest creation')
+  }
+  if (!StrKey.isValidContract(flags['contract-id'] || flags.contractId)) {
+    exit(8, 'invalid contract ID')
+  }
+  if (!/^[0-9a-fA-F]{64}$/.test(flags['tx-hash'] || flags.txHash)) {
+    exit(8, 'invalid transaction hash')
   }
 
   const manifest = createProofManifest({
@@ -215,6 +225,11 @@ async function handleManifest(flags: Record<string, string>): Promise<void> {
     sourceHash: metadata.sourceHash,
     timestamp: metadata.timestamp,
   })
+  try {
+    parseManifest(serializeManifest(manifest))
+  } catch {
+    exit(8, 'invalid manifest fields')
+  }
 
   const serialized = serializeManifest(manifest)
 
@@ -240,19 +255,72 @@ async function handleHash(flags: Record<string, string>): Promise<void> {
   try {
     let hash: string
     if (filePath === '-') {
-      const data = await readStdin()
-      hash = sha256(data)
+      const digest = createHash('sha256')
+      for await (const chunk of process.stdin) digest.update(chunk)
+      hash = digest.digest('hex')
     } else {
       hash = await fileHash(filePath)
     }
 
     printJson({
       algorithm: 'sha256',
-      input: filePath === '-' ? 'stdin' : filePath,
+      input: filePath === '-' ? 'stdin' : 'file',
       hash,
     })
-  } catch (err) {
-    exit(3, `Hashing failed: ${(err as Error).message}`)
+  } catch {
+    exit(8, 'hashing failed')
+  }
+}
+
+async function handleVerifyReceipt(flags: Record<string, string>): Promise<void> {
+  const receiptPath = flags.receipt || flags.r
+  const keysPath = flags.keys || flags.k
+  const network = flags.network
+  const proofId = flags['proof-id'] || flags.proofId
+
+  if (!receiptPath) exit(2, '--receipt is required')
+  if (!keysPath) exit(2, '--keys is required for verification')
+
+  let receipt: SignedVerificationReceipt
+  try {
+    const raw = await readText(receiptPath)
+    if (raw.trim().startsWith('{')) {
+      receipt = JSON.parse(raw)
+    } else {
+      receipt = decodeReceiptFromQr(raw.trim())
+    }
+  } catch {
+    exit(8, 'invalid or unreadable receipt')
+  }
+
+  let keys: Record<string, JsonWebKey>
+  try {
+    const rawKeys = await readText(keysPath)
+    keys = JSON.parse(rawKeys)
+  } catch {
+    exit(8, 'invalid or unreadable keys file')
+  }
+
+  const result = await verifyVerificationReceipt(receipt, {
+    keys,
+    expectedNetworkPassphrase: network,
+    expectedProofId: proofId,
+  })
+
+  if (result.valid) {
+    if (flags.output === 'json' || flags.o === 'json') {
+      printJson({ valid: true, receipt: result.receipt })
+    } else {
+      printText(`✅ Receipt is valid. Verified at: ${result.receipt.verifiedAt}, Result: ${result.receipt.result}`)
+    }
+    exit(0)
+  } else {
+    if (flags.output === 'json' || flags.o === 'json') {
+      printJson({ valid: false, reason: result.reason })
+    } else {
+      printText(`❌ Invalid receipt: ${result.reason}`)
+    }
+    exit(8)
   }
 }
 
@@ -264,15 +332,24 @@ Usage:
   harpocrates <command> [options]
 
 Commands:
-  verify    Verify a proof against the Stellar network.
-  manifest  Create a proof manifest from metadata.
-  hash      Compute the SHA-256 hash of a file.
-  help      Show this help message.
+  verify         Verify a proof against the Stellar network.
+  manifest       Create a proof manifest from metadata.
+  hash           Compute the SHA-256 hash of a file.
+  verify-receipt Verify an offline signed receipt.
+  help           Show this help message.
+
+Verify Receipt options:
+  --receipt, -r     Path to signed receipt JSON or QR payload (use "-" for stdin).
+  --keys, -k        Path to JSON file mapping key IDs to JWKs.
+  --network         Optional expected network passphrase.
+  --proof-id        Optional expected proof ID.
+  --output, -o      Output format: "text" (default) or "json".
 
 Verify options:
   --contract-id     Contract ID on Stellar (required).
   --manifest        Path to a proof manifest JSON file (use "-" for stdin).
   --tx-hash         Transaction hash to verify on-chain.
+  --network         Network passphrase (default: testnet).
   --rpc-url         Stellar RPC URL (default: testnet).
   --source-address  Source address for simulation.
   --output, -o      Output format: "text" (default) or "json".
@@ -282,7 +359,7 @@ Manifest options:
   --input, -i       Path to metadata JSON file (use "-" for stdin; required).
   --tx-hash         Transaction hash from the registration (required).
   --contract-id     Contract ID on Stellar (required).
-  --video-hash      32-byte hex video hash.
+  --video-hash      32-byte hex video hash (required).
   --network         Network passphrase (default: testnet).
   --output, -o      File path to write the manifest to.
   --format          Output format when printing to stdout: "json" (default) or "text".
@@ -292,7 +369,6 @@ Hash options:
 
 Environment variables:
   HARPOCRATES_SOURCE_ADDRESS   Source address for Stellar simulation.
-  HARPOCRATES_RPC_URL          Stellar RPC URL (overrides --rpc-url).
 
 Exit codes:
   0   valid
@@ -310,6 +386,7 @@ Exit codes:
 }
 
 main().catch((err) => {
-  process.stderr.write(`harpocrates: ${(err as Error).message}\n`)
+  void err
+  process.stderr.write('harpocrates: unexpected error\n')
   process.exit(8)
 })
