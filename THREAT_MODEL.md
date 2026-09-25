@@ -625,6 +625,7 @@ must be reconciled against on-chain data for any security-sensitive decision.
 | Quarantine directory and signature scanning (magic bytes) | T6 | `quarantine.py` → `isolate_upload`, `SignatureScanner` |
 | Sandboxed ffmpeg execution (resource profiles, timeouts, and sanitized errors) | T6 | `stego.py` → `_start_decode`, `_start_encode`, `_kill_after_timeout` |
 | AST-based API Schema generation prevents DB injections and application state side-effects during build/CI | T6, T10 | `devx/generate_api_schema.py` |
+| Domain-separated proof-cache keys: SHA-256 over versioned `harpocrates:verifier-cache:v1` tag + length-prefixed fields; hex canonicalization prevents case-variant cache fragmentation | T2, T8 | `verifier_cache.py` → `CACHE_KEY_DOMAIN_TAG`, `_get_cache_key` |
 
 
 ### 7.3 React Frontend
