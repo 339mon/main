@@ -1353,6 +1353,178 @@ def create_app() -> Flask:
             "note": "On-chain verification must be performed via verify_selective_disclosure on the registry contract.",
         })
 
+    # -----------------------------------------------------------------------
+    # C2PA interoperability
+    # -----------------------------------------------------------------------
+
+    @app.post("/api/c2pa/export")
+    def c2pa_export():
+        """
+        Export a C2PA-compatible authenticity manifest from Harpocrates evidence
+        digests.
+
+        Request body (JSON):
+            video_hash    string  32-byte hex (embedded video hash registered on-chain)
+            metadata_hash string  32-byte hex
+            proof_id      string  32-byte hex
+            tier          string  'silent' | 'source' | 'seal'
+            network       string  Stellar network passphrase
+            contract_id   string  Soroban registry contract ID
+            claim_generator string  Optional override for the C2PA claim_generator field
+
+        Response body (JSON):
+            ok            bool    true
+            manifest      object  Serialisable C2PA-compatible manifest
+            digest        string  SHA-256 of the canonical JSON (for round-trip checks)
+            trust_status  string  Always 'signature_not_checked' — C2PA trust is
+                                  independent of on-chain / ZK status
+
+        The C2PA trust status is explicitly separate from Harpocrates on-chain or
+        ZK verification status.  Callers MUST NOT treat the exported manifest as
+        a Harpocrates proof or an on-chain confirmation.
+        """
+        if not request.is_json:
+            return error_response(
+                code=VALIDATION_ERROR,
+                message="JSON body is required",
+                status=400,
+            )
+        body = request.get_json(silent=True) or {}
+
+        required_fields = ("video_hash", "metadata_hash", "proof_id", "tier", "network", "contract_id")
+        for field_name in required_fields:
+            if field_name not in body:
+                return error_response(
+                    code=VALIDATION_ERROR,
+                    message=f"missing required field: {field_name}",
+                    status=400,
+                )
+
+        try:
+            exported = export_c2pa_manifest(
+                video_hash=body["video_hash"],
+                metadata_hash=body["metadata_hash"],
+                proof_id=body["proof_id"],
+                tier=body["tier"],
+                network=body["network"],
+                contract_id=body["contract_id"],
+                claim_generator=body.get("claim_generator"),
+            )
+        except ValueError as exc:
+            return error_response(
+                code=VALIDATION_ERROR,
+                message=str(exc),
+                status=400,
+            )
+
+        return ok_response({
+            "manifest": exported.manifest,
+            "digest": exported.digest,
+            # Explicit trust separation: C2PA export never implies on-chain status.
+            "trust_status": C2paTrustStatus.SIGNATURE_NOT_CHECKED.value,
+            "note": (
+                "C2PA trust status is independent of Harpocrates on-chain and ZK "
+                "verification. Do not treat this manifest as a Harpocrates proof."
+            ),
+        })
+
+    @app.post("/api/c2pa/import")
+    def c2pa_import():
+        """
+        Parse and validate a C2PA-compatible authenticity manifest.
+
+        Request body (JSON):
+            manifest  string | object  Raw manifest (JSON string or pre-parsed object)
+
+        Response body (JSON):
+            ok            bool    true
+            binding       object  Extracted Harpocrates binding fields
+            trust_status  string  'signature_not_checked' — always; see note
+            unknown_assertions  list  Assertions not recognised by this version
+                                      (unsupported_semantics: true)
+            note          string  Trust model clarification
+
+        The trust_status is always 'signature_not_checked'.  C2PA signature
+        verification is out of scope.  The extracted binding must be corroborated
+        against on-chain records via the standard Harpocrates verification flow
+        before any trust decision is made.
+        """
+        if not request.is_json:
+            return error_response(
+                code=VALIDATION_ERROR,
+                message="JSON body is required",
+                status=400,
+            )
+        body = request.get_json(silent=True) or {}
+
+        if "manifest" not in body:
+            return error_response(
+                code=VALIDATION_ERROR,
+                message="missing required field: manifest",
+                status=400,
+            )
+
+        manifest_raw = body["manifest"]
+        # Accept either a pre-parsed object or a raw JSON string.
+        if isinstance(manifest_raw, dict):
+            try:
+                import json as _json
+                manifest_bytes = _json.dumps(manifest_raw, separators=(",", ":")).encode("utf-8")
+            except (TypeError, ValueError):
+                return error_response(
+                    code=VALIDATION_ERROR,
+                    message="manifest object could not be serialised",
+                    status=400,
+                )
+        elif isinstance(manifest_raw, str):
+            manifest_bytes = manifest_raw.encode("utf-8")
+        else:
+            return error_response(
+                code=VALIDATION_ERROR,
+                message="manifest must be a JSON object or string",
+                status=400,
+            )
+
+        try:
+            parsed = parse_c2pa_manifest(manifest_bytes)
+        except C2paParseError as exc:
+            # Privacy-safe: only the reason code and optional field name are returned.
+            err_payload = exc.to_dict()
+            return error_response(
+                code=VALIDATION_ERROR,
+                message=f"C2PA manifest parse failed: {err_payload['reason']}"
+                        + (f" (field: {err_payload['field']})" if err_payload.get("field") else ""),
+                status=400,
+            )
+
+        binding = parsed.binding
+        unknown = [
+            {
+                "label": ua.label,
+                "unsupported_semantics": ua.unsupported_semantics,
+            }
+            for ua in parsed.unknown_assertions
+        ]
+
+        return ok_response({
+            "binding": {
+                "mapping_version": binding.mapping_version,
+                "video_hash": binding.video_hash,
+                "metadata_hash": binding.metadata_hash,
+                "proof_id": binding.proof_id,
+                "tier": binding.tier,
+                "network": binding.network,
+                "contract_id": binding.contract_id,
+            },
+            "trust_status": parsed.trust_status.value,
+            "unknown_assertions": unknown,
+            "note": (
+                "C2PA trust status is independent of Harpocrates on-chain and ZK "
+                "verification. Corroborate this binding against on-chain records "
+                "before making any trust decision."
+            ),
+        })
+
     return app
 
 
