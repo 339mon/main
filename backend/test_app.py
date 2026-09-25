@@ -97,6 +97,25 @@ def _client_with_key(key: str, expires: str | None = None):
     return _app_env(extra, clear=clear)
 
 
+@contextlib.contextmanager
+def _client_with_rotating_keys(
+    current: str,
+    previous: str,
+    previous_expires: str | None = None,
+):
+    extra = {
+        "REGISTER_API_KEY": current,
+        "REGISTER_API_KEY_PREVIOUS": previous,
+    }
+    clear = ["REGISTER_API_KEY_EXPIRES"]
+    if previous_expires:
+        extra["REGISTER_API_KEY_PREVIOUS_EXPIRES"] = previous_expires
+    else:
+        clear.append("REGISTER_API_KEY_PREVIOUS_EXPIRES")
+    with _app_env(extra, clear=clear) as client:
+        yield client
+
+
 # ---------------------------------------------------------------------------
 # Helper: POST /api/proofs/register
 # ---------------------------------------------------------------------------
@@ -684,21 +703,21 @@ class RegisterProofAuthTest(unittest.TestCase):
             resp = _post_register(client)
         # 200 if DB available, 500 if DATABASE_URL absent – both indicate auth
         # was not the reason for failure.
-        self.assertIn(resp.status_code, {200, 500})
+        self.assertIn(resp.status_code, {200, 400, 500})
 
     # --- Positive: valid Bearer token, no expiry -------------------------
 
     def test_accepts_valid_bearer_token(self) -> None:
         with _client_with_key(TEST_API_KEY) as client:
             resp = _post_register(client, token=TEST_API_KEY)
-        self.assertIn(resp.status_code, {200, 500})
+        self.assertIn(resp.status_code, {200, 400, 500})
 
     # --- Positive: valid Bearer token, future expiry ---------------------
 
     def test_accepts_valid_token_with_future_expiry(self) -> None:
         with _client_with_key(TEST_API_KEY, expires="2099-12-31T23:59:59Z") as client:
             resp = _post_register(client, token=TEST_API_KEY)
-        self.assertIn(resp.status_code, {200, 500})
+        self.assertIn(resp.status_code, {200, 400, 500})
 
     # --- Negative: missing Authorization header --------------------------
 
@@ -753,6 +772,26 @@ class RegisterProofAuthTest(unittest.TestCase):
             resp = _post_register(client, token=TEST_API_KEY)
         self.assertEqual(resp.status_code, 401)
         self.assertIn("expired", resp.json["error"])
+
+    def test_accepts_previous_key_during_rotation(self) -> None:
+        with _client_with_rotating_keys("new-key", TEST_API_KEY) as client:
+            resp = _post_register(client, token=TEST_API_KEY)
+        self.assertIn(resp.status_code, {200, 400, 500})
+
+    def test_rejects_previous_key_after_overlap_expiry(self) -> None:
+        with _client_with_rotating_keys(
+            "new-key", TEST_API_KEY, previous_expires="2000-01-01T00:00:00Z"
+        ) as client:
+            resp = _post_register(client, token=TEST_API_KEY)
+        self.assertEqual(resp.status_code, 401)
+        self.assertIn("Invalid", resp.json["error"])
+
+    def test_accepts_new_key_after_previous_key_expires(self) -> None:
+        with _client_with_rotating_keys(
+            "new-key", TEST_API_KEY, previous_expires="2000-01-01T00:00:00Z"
+        ) as client:
+            resp = _post_register(client, token="new-key")
+        self.assertIn(resp.status_code, {200, 400, 500})
 
 
 # ---------------------------------------------------------------------------

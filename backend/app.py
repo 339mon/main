@@ -281,37 +281,41 @@ def create_app() -> Flask:
         - If REGISTER_API_KEY is not configured the endpoint is open (development
           convenience identical to the previous behaviour).
         - Otherwise the request must carry ``Authorization: Bearer <key>``.
-        - If REGISTER_API_KEY_EXPIRES is set and the current UTC time is at or
-          past that instant the key is treated as expired and the request is
-          rejected with 401.
+        - ``REGISTER_API_KEY_PREVIOUS`` can overlap the primary key during a
+          rotation.  It is accepted until its optional expiry, allowing
+          already-deployed clients to transition without downtime.
         """
 
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
-            expected_key = config.register_api_key
-            if expected_key is None:
+            if config.register_api_key is None:
                 # No key configured – allow the request (dev mode).
                 return fn(*args, **kwargs)
-
-            # Check expiry before validating the key so that an expired key
-            # is never accepted even if the token matches.
-            expires = config.register_api_key_expires
-            if expires is not None:
-                from datetime import datetime as _dt
-
-                now = _dt.now(tz=timezone.utc)
-                if now >= expires:
-                    return jsonify({"error": "API key has expired"}), 401
 
             auth_header = request.headers.get("Authorization", "")
             if not auth_header.startswith("Bearer "):
                 return jsonify({"error": "Authorization header with Bearer token is required"}), 401
 
-            provided_key = auth_header[len("Bearer "):]
-            # Constant-time comparison to mitigate timing attacks.
+            provided_key = auth_header[len("Bearer "):].strip()
+            now = datetime.now(tz=timezone.utc)
+
+            # Constant-time comparison is performed for every configured key.
+            # Do not reveal whether a key is primary, previous, or expired.
             import hmac as _hmac
 
-            if not _hmac.compare_digest(provided_key, expected_key):
+            candidates = (
+                (config.register_api_key, config.register_api_key_expires),
+                (config.register_api_key_previous, config.register_api_key_previous_expires),
+            )
+            valid = False
+            for expected_key, expires in candidates:
+                matches = bool(expected_key) and _hmac.compare_digest(provided_key, expected_key)
+                if matches and (expires is None or now < expires):
+                    valid = True
+
+            if not valid:
+                if config.register_api_key_expires is not None and now >= config.register_api_key_expires:
+                    return jsonify({"error": "API key has expired"}), 401
                 return jsonify({"error": "Invalid API key"}), 401
 
             return fn(*args, **kwargs)
@@ -828,6 +832,7 @@ def create_app() -> Flask:
 
     @app.post("/api/proofs/register")
     @limiter.limit(config.ratelimit_register)
+    @require_register_auth
     @idempotent("register")
     def register_proof_event():
         if _enforce_json_size() > config.max_json_bytes:
