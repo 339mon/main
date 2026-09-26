@@ -2,6 +2,11 @@
 
 ## 1.0.0 — Unreleased
 
+- Domain-separated proof-cache keys in the backend verifier cache (#373): keys
+  are SHA-256 digests over the versioned `harpocrates:verifier-cache:v1` domain
+  tag plus length-prefixed fields, eliminating separator-ambiguity collisions
+  and cross-domain key reuse; hex proof/public-input inputs are case- and
+  whitespace-canonicalized. Bump the tag to invalidate all cached entries.
 - Added on-chain **metadata envelope versioning** for the Soroban registry (`MetadataEnvelope`, `bind_metadata_envelope`, auto-V1 stamp on register, V1→V2 upgrade path) aligned with `backend/envelope.py`. See `contracts/METADATA_ENVELOPE.md`. Closes #317.
 
 - Extended structured fuzzing of proof and public-input decoding: proof-hex
